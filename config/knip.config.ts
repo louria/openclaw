@@ -209,6 +209,11 @@ const config = {
       entry: ["index.js!", "scripts/postinstall.js!"],
       project: ["index.js!", "scripts/**/*.js!"],
     },
+    [`${BUNDLED_PLUGIN_ROOT_DIR}/codex-supervisor`]: {
+      entry: [...bundledPluginEntries, "src/mcp-bundle-entry.ts!"],
+      project: ["index.ts!", "src/**/*.{js,mjs,ts}!"],
+      ignoreDependencies: bundledPluginIgnoredRuntimeDependencies,
+    },
     [`${BUNDLED_PLUGIN_ROOT_DIR}/llama-cpp`]: {
       entry: bundledPluginEntries,
       project: ["index.ts!", "src/**/*.{js,mjs,ts}!"],

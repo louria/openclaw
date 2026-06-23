@@ -7,6 +7,7 @@ import {
   registerCodexSupervisorMcpTools,
   sanitizeCodexSupervisorSessionListResult,
 } from "./mcp-tools.js";
+import { CodexSafetyAuditStore } from "./safety-audit.js";
 import type { CodexSupervisor } from "./supervisor.js";
 
 describe("redactCodexSupervisorValue", () => {
@@ -69,6 +70,73 @@ describe("sanitizeCodexSupervisorSessionListResult", () => {
 });
 
 describe("registerCodexSupervisorMcpTools", () => {
+  it("provides a bounded wait primitive for persistent monitor loops", async () => {
+    const handlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
+    const server = {
+      tool(name: string, _description: string, _schema: unknown, handler: unknown) {
+        handlers.set(name, handler as (params: Record<string, unknown>) => Promise<unknown>);
+      },
+    } as unknown as McpServer;
+
+    registerCodexSupervisorMcpTools(server, {} as CodexSupervisor);
+
+    await expect(
+      handlers.get("codex_supervisor_wait")?.({ milliseconds: 10 }),
+    ).resolves.toMatchObject({ structuredContent: { milliseconds: 10 } });
+  });
+
+  it("persists and confirms an exact-turn safety stop", async () => {
+    const handlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
+    const server = {
+      tool(name: string, _description: string, _schema: unknown, handler: unknown) {
+        handlers.set(name, handler as (params: Record<string, unknown>) => Promise<unknown>);
+      },
+    } as unknown as McpServer;
+    const supervisor = {
+      stopExactTurn: async (params: Record<string, unknown>) => ({
+        ...params,
+        confirmedStopped: true,
+        processesStopped: 1,
+      }),
+    } as unknown as CodexSupervisor;
+    const auditStore = new CodexSafetyAuditStore(":memory:");
+
+    registerCodexSupervisorMcpTools(server, supervisor, {
+      writeControlsAllowed: () => true,
+      safetyAuditStore: auditStore,
+    });
+    await expect(
+      handlers.get("codex_safety_stop")?.({
+        endpoint_id: "target",
+        thread_id: "thread-1",
+        turn_id: "turn-1",
+        reason: "test trigger",
+        evidence: "Bearer abcdefghijklmnopqrstuvwxyz012345",
+      }),
+    ).resolves.toMatchObject({
+      structuredContent: {
+        result: {
+          endpointId: "target",
+          threadId: "thread-1",
+          turnId: "turn-1",
+          confirmedStopped: true,
+          processesStopped: 1,
+        },
+      },
+    });
+    expect(auditStore.listUnnotified()).toEqual([
+      expect.objectContaining({
+        endpointId: "target",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        reason: "test trigger",
+        evidence: "Bearer [redacted]",
+        status: "stopped",
+      }),
+    ]);
+    auditStore.close();
+  });
+
   it("uses per-server transcript policy when listing sessions", async () => {
     const handlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
     const server = {

@@ -5,6 +5,7 @@ import { Type, type Static } from "typebox";
 import type { CodexSupervisorEndpoint } from "./types.js";
 
 const ENDPOINTS_ENV = "OPENCLAW_CODEX_SUPERVISOR_ENDPOINTS";
+const TARGET_TOKEN_ENV = "OPENCLAW_CODEX_TARGET_TOKEN";
 
 const StdioEndpointSchema = Type.Object(
   {
@@ -111,7 +112,11 @@ function requireUniqueEndpointIds(endpoints: CodexSupervisorEndpoint[]): CodexSu
   return endpoints;
 }
 
-function endpointFromToken(token: string, index: number): CodexSupervisorEndpoint | undefined {
+function endpointFromToken(
+  token: string,
+  index: number,
+  authTokenEnv?: string,
+): CodexSupervisorEndpoint | undefined {
   const trimmed = token.trim();
   if (!trimmed) {
     return undefined;
@@ -125,6 +130,7 @@ function endpointFromToken(token: string, index: number): CodexSupervisorEndpoin
       id: normalizeEndpointId("", index),
       transport: "websocket",
       url: trimmed,
+      ...(authTokenEnv ? { authTokenEnv } : {}),
     };
   }
   if (trimmed === "local" || trimmed === "proxy" || trimmed === "stdio") {
@@ -143,6 +149,7 @@ function endpointFromToken(token: string, index: number): CodexSupervisorEndpoin
       id: normalizeEndpointId(id ?? "", index),
       transport: "websocket",
       url,
+      ...(authTokenEnv ? { authTokenEnv } : {}),
     };
   }
   return undefined;
@@ -177,10 +184,11 @@ export function loadCodexSupervisorEndpoints(
         .filter((entry): entry is CodexSupervisorEndpoint => Boolean(entry)),
     );
   }
+  const shorthandAuthTokenEnv = env[TARGET_TOKEN_ENV]?.trim() ? TARGET_TOKEN_ENV : undefined;
   return requireUniqueEndpointIds(
     raw
       .split(",")
-      .map(endpointFromToken)
+      .map((entry, index) => endpointFromToken(entry, index, shorthandAuthTokenEnv))
       .filter((entry): entry is CodexSupervisorEndpoint => Boolean(entry)),
   );
 }

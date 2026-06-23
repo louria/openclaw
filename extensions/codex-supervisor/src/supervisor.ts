@@ -289,6 +289,67 @@ export class CodexSupervisor {
     }
   }
 
+  /**
+   * Interrupts only the caller-specified active turn and waits for app-server
+   * to confirm that exact turn is no longer running.
+   */
+  async stopExactTurn(params: {
+    endpointId: string;
+    threadId: string;
+    turnId: string;
+    timeoutMs?: number;
+  }): Promise<{
+    endpointId: string;
+    threadId: string;
+    turnId: string;
+    confirmedStopped: true;
+    processesStopped: number;
+  }> {
+    const connection = await this.connectionFor(params.endpointId);
+    try {
+      const activeTurnId = await this.findActiveTurnId(connection, params.threadId);
+      if (activeTurnId !== params.turnId) {
+        throw new Error(
+          activeTurnId
+            ? `refusing stale safety stop: expected ${params.turnId}, active turn is ${activeTurnId}`
+            : `refusing stale safety stop: ${params.threadId} has no readable active turn`,
+        );
+      }
+
+      await connection.request("turn/interrupt", {
+        threadId: params.threadId,
+        turnId: params.turnId,
+      });
+      const terminalsBefore = await this.listBackgroundTerminals(connection, params.threadId);
+      await connection.request("thread/backgroundTerminals/clean", {
+        threadId: params.threadId,
+      });
+
+      const timeoutMs = Math.max(100, Math.min(30_000, params.timeoutMs ?? 10_000));
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const currentTurnId = await this.findActiveTurnId(connection, params.threadId);
+        const terminalsAfter = await this.listBackgroundTerminals(connection, params.threadId);
+        if (currentTurnId !== params.turnId && terminalsAfter.length === 0) {
+          return {
+            ...params,
+            confirmedStopped: true,
+            processesStopped: terminalsBefore.length,
+          };
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 50);
+        });
+      }
+      throw new Error(
+        `Codex turn ${params.turnId} or its background terminals remained active ${timeoutMs}ms after interruption`,
+      );
+    } catch (error) {
+      this.forgetEndpoint(params.endpointId);
+      throw error;
+    }
+  }
+
   private async listEndpointSessions(
     endpoint: CodexSupervisorEndpoint,
     params: { includeStored?: boolean; maxStoredSessions?: number },
@@ -461,6 +522,29 @@ export class CodexSupervisor {
     } catch {
       return undefined;
     }
+  }
+
+  private async findActiveTurnId(
+    connection: CodexJsonRpcConnection,
+    threadId: string,
+  ): Promise<string | undefined> {
+    const read = await this.readThread(connection, threadId, true);
+    const thread = extractThread(read);
+    return (
+      (thread ? findInProgressTurnId(thread) : undefined) ??
+      (await this.readActiveTurnId(connection, threadId))
+    );
+  }
+
+  private async listBackgroundTerminals(
+    connection: CodexJsonRpcConnection,
+    threadId: string,
+  ): Promise<Record<string, unknown>[]> {
+    const response = await connection.request("thread/backgroundTerminals/list", {
+      threadId,
+      limit: 1000,
+    });
+    return isRecord(response) ? asRecordArray(response.data) : [];
   }
 
   private async resolveEndpointId(params: {

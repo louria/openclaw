@@ -9,6 +9,11 @@ import {
   registerCodexSupervisorMcpTools,
   type CodexSupervisorMcpToolOptions,
 } from "./mcp-tools.js";
+import { CodexSafetyAuditStore, SAFETY_AUDIT_DB_ENV } from "./safety-audit.js";
+import {
+  SlackSafetyAuditNotifier,
+  slackSafetyNotifierConfigFromEnvironment,
+} from "./slack-safety-notifier.js";
 import { CodexSupervisor } from "./supervisor.js";
 
 const VERSION = "0.1.0";
@@ -26,6 +31,8 @@ function routeLogsToStderr(): void {
 export type CodexSupervisorMcpServeOptions = {
   supervisor?: CodexSupervisor;
   toolOptions?: CodexSupervisorMcpToolOptions;
+  auditStore?: CodexSafetyAuditStore;
+  notifier?: SlackSafetyAuditNotifier;
 };
 
 /**
@@ -37,14 +44,35 @@ export function createCodexSupervisorMcpServer(opts: CodexSupervisorMcpServeOpti
   close: () => Promise<void>;
 } {
   const supervisor = opts.supervisor ?? new CodexSupervisor(loadCodexSupervisorEndpoints());
+  const configuredAuditPath = process.env[SAFETY_AUDIT_DB_ENV]?.trim();
+  const ownedAuditStore =
+    !opts.auditStore && configuredAuditPath
+      ? new CodexSafetyAuditStore(configuredAuditPath)
+      : undefined;
+  const auditStore = opts.auditStore ?? ownedAuditStore;
+  const notifierConfig = slackSafetyNotifierConfigFromEnvironment();
+  if (notifierConfig && !auditStore && !opts.notifier) {
+    throw new Error(`Slack safety notification requires ${SAFETY_AUDIT_DB_ENV}`);
+  }
+  const ownedNotifier =
+    !opts.notifier && auditStore && notifierConfig
+      ? new SlackSafetyAuditNotifier(auditStore, notifierConfig)
+      : undefined;
+  const notifier = opts.notifier ?? ownedNotifier;
   const server = new McpServer({ name: "openclaw-codex-supervisor", version: VERSION });
-  registerCodexSupervisorMcpTools(server, supervisor, opts.toolOptions);
+  registerCodexSupervisorMcpTools(server, supervisor, {
+    ...opts.toolOptions,
+    ...(auditStore ? { safetyAuditStore: auditStore } : {}),
+  });
+  notifier?.start();
   return {
     server,
     supervisor,
     close: async () => {
+      await notifier?.stop();
       await supervisor.close();
       await server.close();
+      ownedAuditStore?.close();
     },
   };
 }

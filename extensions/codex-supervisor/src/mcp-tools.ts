@@ -4,6 +4,7 @@
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { CodexSafetyAuditStore } from "./safety-audit.js";
 import type { CodexSupervisor } from "./supervisor.js";
 import type {
   CodexSupervisorEndpoint,
@@ -20,7 +21,12 @@ export const WRITE_CONTROLS_ENV = "OPENCLAW_CODEX_SUPERVISOR_ALLOW_WRITE_CONTROL
 export type CodexSupervisorMcpToolOptions = {
   rawTranscriptReadsAllowed?: () => boolean;
   writeControlsAllowed?: () => boolean;
+  safetyAuditStore?: CodexSafetyAuditStore;
 };
+
+function boundedRedactedText(value: string, maxLength: number): string {
+  return String(redactCodexSupervisorValue(value)).slice(0, maxLength);
+}
 
 function textResult(text: string, structuredContent?: Record<string, unknown>) {
   return {
@@ -278,4 +284,64 @@ export function registerCodexSupervisorMcpTools(
       }
     },
   );
+
+  server.tool(
+    "codex_supervisor_wait",
+    "Wait briefly before the next supervision pass to avoid a busy loop.",
+    {
+      milliseconds: z.number().int().min(10).max(60_000),
+    },
+    async ({ milliseconds }) => {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, milliseconds);
+      });
+      return textResult(`supervisor waited ${milliseconds}ms`, { milliseconds });
+    },
+  );
+
+  const auditStore = opts.safetyAuditStore;
+  if (auditStore) {
+    server.tool(
+      "codex_safety_stop",
+      "Fail closed: stop one exact active Codex turn and persist an audit alert.",
+      {
+        endpoint_id: z.string().min(1),
+        thread_id: z.string().min(1),
+        turn_id: z.string().min(1),
+        reason: z.string().min(1).max(500),
+        evidence: z.string().max(2000).optional(),
+      },
+      async ({ endpoint_id, thread_id, turn_id, reason, evidence }) => {
+        if (!writeControlsAllowedFor(opts)) {
+          return errorResult(
+            `Codex write controls are disabled; set ${WRITE_CONTROLS_ENV}=1 for a trusted supervisor-only MCP`,
+          );
+        }
+        const auditId = auditStore.begin({
+          endpointId: endpoint_id,
+          threadId: thread_id,
+          turnId: turn_id,
+          reason: boundedRedactedText(reason, 500),
+          ...(evidence ? { evidence: boundedRedactedText(evidence, 2000) } : {}),
+        });
+        try {
+          const result = await supervisor.stopExactTurn({
+            endpointId: endpoint_id,
+            threadId: thread_id,
+            turnId: turn_id,
+          });
+          auditStore.markStopped(auditId);
+          return textResult(`codex safety stop confirmed: ${turn_id}`, {
+            auditId,
+            result,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const redactedMessage = boundedRedactedText(message, 2000);
+          auditStore.markFailed(auditId, redactedMessage);
+          return errorResult(redactedMessage);
+        }
+      },
+    );
+  }
 }

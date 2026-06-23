@@ -90,6 +90,22 @@ describe("loadCodexSupervisorEndpoints", () => {
     ]);
   });
 
+  it("uses the target bearer token for shorthand websocket endpoints", () => {
+    expect(
+      loadCodexSupervisorEndpoints({
+        OPENCLAW_CODEX_SUPERVISOR_ENDPOINTS: "target=ws://127.0.0.1:18789",
+        OPENCLAW_CODEX_TARGET_TOKEN: "secret-token",
+      }),
+    ).toEqual([
+      {
+        id: "target",
+        transport: "websocket",
+        url: "ws://127.0.0.1:18789",
+        authTokenEnv: "OPENCLAW_CODEX_TARGET_TOKEN",
+      },
+    ]);
+  });
+
   it("keeps equals signs inside endpoint URLs", () => {
     expect(
       loadCodexSupervisorEndpoints({
@@ -183,6 +199,80 @@ describe("loadCodexSupervisorEndpoints", () => {
 });
 
 describe("CodexSupervisor", () => {
+  it("stops only the expected active turn and confirms it is no longer running", async () => {
+    const fake = new FakeCodexConnection({});
+    let active = true;
+    let terminalActive = true;
+    fake.request = async (method, params) => {
+      fake.calls.push({ method, params });
+      if (method === "thread/read") {
+        return {
+          thread: {
+            id: "thread-1",
+            status: { type: active ? "active" : "idle" },
+            turns: [{ id: "turn-1", status: active ? "inProgress" : "interrupted" }],
+          },
+        };
+      }
+      if (method === "turn/interrupt") {
+        active = false;
+        return {};
+      }
+      if (method === "thread/backgroundTerminals/list") {
+        return { data: terminalActive ? [{ processId: "123" }] : [] };
+      }
+      if (method === "thread/backgroundTerminals/clean") {
+        terminalActive = false;
+        return {};
+      }
+      throw new Error(`unexpected method: ${method}`);
+    };
+    const supervisor = new CodexSupervisor([endpoint], async () => fake);
+
+    await expect(
+      supervisor.stopExactTurn({
+        endpointId: "local",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+    ).resolves.toEqual({
+      endpointId: "local",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      confirmedStopped: true,
+      processesStopped: 1,
+    });
+    expect(fake.calls.filter((call) => call.method === "turn/interrupt")).toEqual([
+      {
+        method: "turn/interrupt",
+        params: { threadId: "thread-1", turnId: "turn-1" },
+      },
+    ]);
+    expect(fake.calls.some((call) => call.method === "thread/backgroundTerminals/clean")).toBe(
+      true,
+    );
+  });
+
+  it("refuses a stale exact-turn safety stop", async () => {
+    const fake = new FakeCodexConnection({
+      id: "thread-1",
+      status: { type: "active" },
+      turns: [{ id: "turn-current", status: "inProgress" }],
+    });
+    const supervisor = new CodexSupervisor([endpoint], async () => fake);
+
+    await expect(
+      supervisor.stopExactTurn({
+        endpointId: "local",
+        threadId: "thread-1",
+        turnId: "turn-stale",
+      }),
+    ).rejects.toThrow(
+      "refusing stale safety stop: expected turn-stale, active turn is turn-current",
+    );
+    expect(fake.calls.some((call) => call.method === "turn/interrupt")).toBe(false);
+  });
+
   it("does not permanently cache failed endpoint connections", async () => {
     const fake = new FakeCodexConnection({
       id: "thread-1",
