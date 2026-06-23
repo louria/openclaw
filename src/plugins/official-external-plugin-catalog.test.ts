@@ -6,10 +6,12 @@ import officialExternalPluginCatalog from "../../scripts/lib/official-external-p
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import { createSqliteHostedOfficialExternalPluginCatalogSnapshotStore } from "./official-external-plugin-catalog-snapshot-store.js";
 import {
+  DEFAULT_OFFICIAL_EXTERNAL_PLUGIN_CATALOG_FEED_URL,
   type OfficialExternalPluginCatalogEntry,
   createInMemoryHostedOfficialExternalPluginCatalogSnapshotStore,
   getOfficialExternalPluginCatalogEntry,
   isOfficialExternalPluginCatalogFeed,
+  filterOfficialExternalPluginCatalogEntriesBySourceRefs,
   listOfficialExternalPluginCatalogEntries,
   loadHostedOfficialExternalPluginCatalogEntries,
   parseOfficialExternalPluginCatalogEntries,
@@ -19,6 +21,7 @@ import {
   resolveOfficialExternalWebProviderContractPluginIdsForEnv,
   resolveOfficialExternalPluginId,
   resolveOfficialExternalPluginInstall,
+  validateOfficialExternalPluginCatalogEntrySourceRefs,
 } from "./official-external-plugin-catalog.js";
 
 function expectCatalogEntry(id: string): OfficialExternalPluginCatalogEntry {
@@ -137,6 +140,242 @@ describe("official external plugin catalog", () => {
       });
       expect(result.metadata.checksum).toMatch(/^sha256:[0-9a-f]{64}$/);
     }
+  });
+
+  it("uses the default local feed profile for hosted catalog loading", async () => {
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      id: "openclaw-official-external-plugins",
+      generatedAt: "2026-06-22T00:00:00.000Z",
+      sequence: 8,
+      entries: [
+        {
+          name: "@openclaw/default-profile-proof",
+          kind: "plugin",
+          openclaw: { plugin: { id: "default-profile-proof" } },
+        },
+      ],
+    });
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      expect(String(url)).toBe(DEFAULT_OFFICIAL_EXTERNAL_PLUGIN_CATALOG_FEED_URL);
+      return new Response(body, { status: 200 });
+    });
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedProfile: "clawhub-public",
+      catalogConfig: {
+        sources: { "acme-npm": { type: "npm", registry: "https://packages.acme.example/npm/" } },
+      },
+      fetchImpl,
+      snapshotStore: null,
+    });
+
+    expect(result.source).toBe("hosted");
+    expect(result.entries.map((entry) => entry.name)).toEqual(["@openclaw/default-profile-proof"]);
+  });
+
+  it("allows named local feed profiles to authorize their configured HTTPS host", async () => {
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      id: "openclaw-official-external-plugins",
+      generatedAt: "2026-06-22T00:00:00.000Z",
+      sequence: 9,
+      entries: [
+        {
+          name: "@acme/private-proof",
+          kind: "plugin",
+          install: {
+            candidates: [
+              {
+                sourceRef: "acme-npm",
+                package: "@acme/private-proof",
+                version: "1.0.0",
+              },
+            ],
+          },
+          openclaw: {
+            plugin: { id: "private-proof" },
+            install: { sourceRef: "acme-npm", npmSpec: "@acme/private-proof" },
+          },
+        },
+      ],
+    });
+    const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
+      expect(String(url)).toBe("https://packages.acme.example/openclaw/feed");
+      return new Response(body, { status: 200 });
+    });
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedProfile: "acme",
+      catalogConfig: {
+        feeds: { acme: { url: "https://packages.acme.example/openclaw/feed" } },
+        sources: { "acme-npm": { type: "npm", registry: "https://packages.acme.example/npm/" } },
+      },
+      fetchImpl,
+      snapshotStore: null,
+    });
+
+    expect(result.source).toBe("hosted");
+    expect(result.entries.map((entry) => entry.name)).toEqual(["@acme/private-proof"]);
+  });
+
+  it("keeps direct hosted feed URL overrides constrained to the public allowlist", async () => {
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedUrl: "https://packages.acme.example/openclaw/feed",
+      fetchImpl,
+      snapshotStore: null,
+    });
+
+    expect(result.source).toBe("bundled-fallback");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    if (result.source === "bundled-fallback") {
+      expect(result.error).toContain("hostname is not allowed");
+    }
+  });
+
+  it("requires manifest install source refs for custom local feed profiles", async () => {
+    const missingManifestSourceRef = {
+      name: "@acme/missing-manifest-source-ref",
+      kind: "plugin",
+      openclaw: {
+        plugin: { id: "missing-manifest-source-ref" },
+        install: { npmSpec: "@acme/missing-manifest-source-ref" },
+      },
+    };
+    const knownManifestSourceRef = {
+      name: "@acme/known-manifest-source-ref",
+      kind: "plugin",
+      openclaw: {
+        plugin: { id: "known-manifest-source-ref" },
+        install: {
+          sourceRef: "acme-npm",
+          npmSpec: "@acme/known-manifest-source-ref",
+        },
+      },
+    };
+    const implicitNameInstall = {
+      name: "@acme/implicit-name-install",
+      kind: "plugin",
+      openclaw: { plugin: { id: "implicit-name-install" } },
+    };
+    const topLevelCandidateOnly = {
+      name: "@acme/top-level-candidate-only",
+      kind: "plugin",
+      install: {
+        candidates: [{ sourceRef: "acme-npm", package: "@acme/top-level-candidate-only" }],
+      },
+      openclaw: {
+        plugin: { id: "top-level-candidate-only" },
+        install: { npmSpec: "@acme/top-level-candidate-only" },
+      },
+    };
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      id: "openclaw-official-external-plugins",
+      generatedAt: "2026-06-22T00:00:00.000Z",
+      sequence: 11,
+      entries: [
+        missingManifestSourceRef,
+        implicitNameInstall,
+        topLevelCandidateOnly,
+        knownManifestSourceRef,
+      ],
+    });
+
+    const catalogConfig = {
+      feeds: { acme: { url: "https://packages.acme.example/openclaw/feed" } },
+      sources: { "acme-npm": { type: "npm" as const } },
+    };
+
+    expect(
+      validateOfficialExternalPluginCatalogEntrySourceRefs(missingManifestSourceRef, {
+        catalogConfig,
+        requireManifestInstallSourceRef: true,
+      }),
+    ).toEqual(["feed install candidate is missing sourceRef"]);
+    expect(
+      validateOfficialExternalPluginCatalogEntrySourceRefs(implicitNameInstall, {
+        catalogConfig,
+        requireManifestInstallSourceRef: true,
+      }),
+    ).toEqual(["feed install candidate is missing sourceRef"]);
+    expect(
+      validateOfficialExternalPluginCatalogEntrySourceRefs(topLevelCandidateOnly, {
+        catalogConfig,
+        requireManifestInstallSourceRef: true,
+      }),
+    ).toEqual(["feed install candidate is missing sourceRef"]);
+    expect(
+      validateOfficialExternalPluginCatalogEntrySourceRefs(knownManifestSourceRef, {
+        catalogConfig,
+        requireManifestInstallSourceRef: true,
+      }),
+    ).toEqual([]);
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedProfile: "acme",
+      catalogConfig,
+      fetchImpl: vi.fn(async () => new Response(body, { status: 200 })),
+      snapshotStore: null,
+    });
+
+    expect(result.source).toBe("hosted");
+    expect(result.entries.map((entry) => entry.name)).toEqual(["@acme/known-manifest-source-ref"]);
+  });
+
+  it("filters hosted feed entries that reference unknown local source profiles", async () => {
+    const knownEntry = {
+      name: "@openclaw/source-ref-known",
+      kind: "plugin",
+      install: { candidates: [{ sourceRef: "public-npm", package: "@openclaw/source-ref-known" }] },
+      openclaw: { plugin: { id: "source-ref-known" } },
+    };
+    const unknownEntry = {
+      name: "@openclaw/source-ref-unknown",
+      kind: "plugin",
+      install: {
+        candidates: [{ sourceRef: "attacker-npm", package: "@openclaw/source-ref-unknown" }],
+      },
+      openclaw: { plugin: { id: "source-ref-unknown" } },
+    };
+    const missingEntry = {
+      name: "@openclaw/source-ref-missing",
+      kind: "plugin",
+      install: { candidates: [{ package: "@openclaw/source-ref-missing" }] },
+      openclaw: { plugin: { id: "source-ref-missing" } },
+    };
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      id: "openclaw-official-external-plugins",
+      generatedAt: "2026-06-22T00:00:00.000Z",
+      sequence: 10,
+      entries: [knownEntry, unknownEntry, missingEntry],
+    });
+
+    expect(validateOfficialExternalPluginCatalogEntrySourceRefs(knownEntry)).toEqual([]);
+    expect(validateOfficialExternalPluginCatalogEntrySourceRefs(unknownEntry)).toEqual([
+      'feed install candidate references unknown sourceRef "attacker-npm"',
+    ]);
+    expect(validateOfficialExternalPluginCatalogEntrySourceRefs(missingEntry)).toEqual([
+      "feed install candidate is missing sourceRef",
+    ]);
+    expect(
+      filterOfficialExternalPluginCatalogEntriesBySourceRefs([
+        knownEntry,
+        unknownEntry,
+        missingEntry,
+      ]).map((entry) => entry.name),
+    ).toEqual(["@openclaw/source-ref-known"]);
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      fetchImpl: vi.fn(async () => new Response(body, { status: 200 })),
+      snapshotStore: null,
+    });
+
+    expect(result.source).toBe("hosted");
+    expect(result.entries.map((entry) => entry.name)).toEqual(["@openclaw/source-ref-known"]);
   });
 
   it("falls back to the bundled catalog when hosted feed validation fails", async () => {
@@ -323,6 +562,59 @@ describe("official external plugin catalog", () => {
       closeOpenClawStateDatabaseForTest();
       rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it("applies custom source-ref validation to exception snapshot fallback", async () => {
+    const body = JSON.stringify({
+      schemaVersion: 1,
+      id: "openclaw-official-external-plugins",
+      generatedAt: "2026-06-22T00:00:00.000Z",
+      sequence: 12,
+      entries: [
+        {
+          name: "@acme/snapshot-missing-source-ref",
+          kind: "plugin",
+          openclaw: {
+            plugin: { id: "snapshot-missing-source-ref" },
+            install: { npmSpec: "@acme/snapshot-missing-source-ref" },
+          },
+        },
+        {
+          name: "@acme/snapshot-known-source-ref",
+          kind: "plugin",
+          openclaw: {
+            plugin: { id: "snapshot-known-source-ref" },
+            install: { sourceRef: "acme-npm", npmSpec: "@acme/snapshot-known-source-ref" },
+          },
+        },
+      ],
+    });
+    const catalogConfig = {
+      feeds: { acme: { url: "https://packages.acme.example/openclaw/feed" } },
+      sources: { "acme-npm": { type: "npm" as const } },
+    };
+    const seeded = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedProfile: "acme",
+      catalogConfig,
+      snapshotStore: createInMemoryHostedOfficialExternalPluginCatalogSnapshotStore(),
+      fetchImpl: vi.fn(async () => new Response(body, { status: 200 })),
+    });
+    if (seeded.source !== "hosted") {
+      throw new Error("expected seeded hosted feed");
+    }
+    const snapshotStore = createInMemoryHostedOfficialExternalPluginCatalogSnapshotStore([
+      { body, metadata: seeded.metadata, savedAt: "2026-06-22T01:02:03.000Z" },
+    ]);
+
+    const result = await loadHostedOfficialExternalPluginCatalogEntries({
+      feedProfile: "acme",
+      catalogConfig,
+      snapshotStore,
+      fetchImpl: vi.fn(async () => new Response("{ nope", { status: 200 })),
+    });
+
+    expect(result.source).toBe("hosted-snapshot");
+    expect(result.entries.map((entry) => entry.name)).toEqual(["@acme/snapshot-known-source-ref"]);
   });
 
   it("uses the last known good snapshot when the hosted feed returns HTTP 304", async () => {
