@@ -12,6 +12,11 @@ exact active turn. The stop operation rejects stale turn IDs, interrupts the
 turn, cleans that thread's background terminals, waits for both to become
 inactive, and persists the result in a local SQLite outbox.
 
+The monitor bootstrap enables the internal Codex `/go` lifecycle per thread
+through `thread/persistentMode/set`. The monitor app-server must therefore be
+an internal Codex build that exposes that experimental API; a process-wide
+environment fallback is neither used nor supported.
+
 Required supervisor-only environment:
 
 - `OPENCLAW_CODEX_SUPERVISOR_ENDPOINTS`

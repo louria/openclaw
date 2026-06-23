@@ -8,7 +8,10 @@ export type CodexSafetyMonitorBootstrapOptions = {
   workspace: string;
   threadFile: string;
   promptFile: string;
+  continuationFile: string;
 };
+
+const MAX_PERSISTENT_MODE_MESSAGE_BYTES = 1_000;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -87,9 +90,20 @@ export async function bootstrapCodexSafetyMonitor(
   opts: CodexSafetyMonitorBootstrapOptions,
   connect: typeof connectCodexAppServerEndpoint = connectCodexAppServerEndpoint,
 ): Promise<{ threadId: string; startedTurn: boolean }> {
-  const developerInstructions = (await readFile(opts.promptFile, "utf8")).trim();
+  const [developerInstructions, continuationMessage] = await Promise.all([
+    readFile(opts.promptFile, "utf8").then((value) => value.trim()),
+    readFile(opts.continuationFile, "utf8").then((value) => value.trim()),
+  ]);
   if (!developerInstructions) {
     throw new Error("Codex safety monitor prompt must not be empty");
+  }
+  if (!continuationMessage) {
+    throw new Error("Codex safety monitor continuation must not be empty");
+  }
+  if (Buffer.byteLength(continuationMessage, "utf8") > MAX_PERSISTENT_MODE_MESSAGE_BYTES) {
+    throw new Error(
+      `Codex safety monitor continuation must not exceed ${MAX_PERSISTENT_MODE_MESSAGE_BYTES} bytes`,
+    );
   }
   const connection = await connect({
     id: "safety-monitor",
@@ -98,6 +112,12 @@ export async function bootstrapCodexSafetyMonitor(
   });
   try {
     const ensured = await ensureThread(connection, opts, developerInstructions);
+    // Persistent mode is thread-scoped app-server state. Refresh it on every
+    // bootstrap so a resumed monitor never depends on process-wide defaults.
+    await connection.request("thread/persistentMode/set", {
+      threadId: ensured.threadId,
+      continuationMessage,
+    });
     if (!ensured.created) {
       const read = await connection.request("thread/read", {
         threadId: ensured.threadId,
@@ -138,5 +158,6 @@ export function bootstrapOptionsFromEnvironment(
     workspace: required("OPENCLAW_CODEX_MONITOR_WORKSPACE"),
     threadFile: required("OPENCLAW_CODEX_MONITOR_THREAD_FILE"),
     promptFile: required("OPENCLAW_CODEX_MONITOR_PROMPT_FILE"),
+    continuationFile: required("OPENCLAW_CODEX_MONITOR_CONTINUATION_FILE"),
   };
 }

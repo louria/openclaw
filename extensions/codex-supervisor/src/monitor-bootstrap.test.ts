@@ -17,8 +17,10 @@ describe("bootstrapCodexSafetyMonitor", () => {
     const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "codex-monitor-"));
     cleanup.push(root);
     const promptFile = path.join(root, "prompt.md");
+    const continuationFile = path.join(root, "continuation.md");
     const threadFile = path.join(root, "state", "thread-id");
     await fs.writeFile(promptFile, "monitor safely");
+    await fs.writeFile(continuationFile, "continue monitoring");
     const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
     const connection: CodexJsonRpcConnection = {
       request: async (method, params) => {
@@ -28,6 +30,9 @@ describe("bootstrapCodexSafetyMonitor", () => {
         }
         if (method === "turn/start") {
           return { turn: { id: "turn-1" } };
+        }
+        if (method === "thread/persistentMode/set") {
+          return { continuationMessage: "continue monitoring" };
         }
         throw new Error(`unexpected ${method}`);
       },
@@ -42,16 +47,25 @@ describe("bootstrapCodexSafetyMonitor", () => {
           workspace: root,
           threadFile,
           promptFile,
+          continuationFile,
         },
         async () => connection,
       ),
     ).resolves.toEqual({ threadId: "thread-monitor", startedTurn: true });
     await expect(fs.readFile(threadFile, "utf8")).resolves.toBe("thread-monitor\n");
-    expect(calls.map((call) => call.method)).toEqual(["thread/start", "turn/start"]);
+    expect(calls.map((call) => call.method)).toEqual([
+      "thread/start",
+      "thread/persistentMode/set",
+      "turn/start",
+    ]);
     expect(calls[0]?.params).toMatchObject({
       approvalPolicy: "never",
       sandbox: "read-only",
       developerInstructions: "monitor safely",
+    });
+    expect(calls[1]?.params).toEqual({
+      threadId: "thread-monitor",
+      continuationMessage: "continue monitoring",
     });
   });
 
@@ -59,8 +73,10 @@ describe("bootstrapCodexSafetyMonitor", () => {
     const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "codex-monitor-"));
     cleanup.push(root);
     const promptFile = path.join(root, "prompt.md");
+    const continuationFile = path.join(root, "continuation.md");
     const threadFile = path.join(root, "thread-id");
     await fs.writeFile(promptFile, "monitor safely");
+    await fs.writeFile(continuationFile, "continue monitoring");
     await fs.writeFile(threadFile, "thread-monitor\n");
     const calls: string[] = [];
     const connection: CodexJsonRpcConnection = {
@@ -72,6 +88,9 @@ describe("bootstrapCodexSafetyMonitor", () => {
         if (method === "thread/read") {
           return { thread: { id: "thread-monitor", status: { type: "active" } } };
         }
+        if (method === "thread/persistentMode/set") {
+          return { continuationMessage: "continue monitoring" };
+        }
         throw new Error(`unexpected ${method}`);
       },
       notify: () => undefined,
@@ -85,10 +104,11 @@ describe("bootstrapCodexSafetyMonitor", () => {
           workspace: root,
           threadFile,
           promptFile,
+          continuationFile,
         },
         async () => connection,
       ),
     ).resolves.toEqual({ threadId: "thread-monitor", startedTurn: false });
-    expect(calls).toEqual(["thread/resume", "thread/read"]);
+    expect(calls).toEqual(["thread/resume", "thread/persistentMode/set", "thread/read"]);
   });
 });
