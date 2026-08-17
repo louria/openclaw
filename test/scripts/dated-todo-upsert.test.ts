@@ -308,7 +308,7 @@ describe("dated TODO report validation", () => {
   });
 
   it("binds the report date and file locations to the fresh checkout", () => {
-    const verifiedReport = REPORT.replace("src/urgent.ts:7", "scripts/github/pr-ci-sweeper.mjs:1");
+    const verifiedReport = REPORT.replace("src/urgent.ts:7", "scripts/watch-pr-ci.mjs:1");
 
     expect(() =>
       validateDatedTodoReport(verifiedReport, {
