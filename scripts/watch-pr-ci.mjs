@@ -400,10 +400,7 @@ async function main(argv = process.argv.slice(2)) {
     },
   });
   if (attachment === undefined) {
-    return emit(
-      'NO-RUN-ATTACHED hint="close/reopen re-fires CI; pr-ci-sweeper re-fires hourly at :07"',
-      13,
-    );
+    return emit('NO-RUN-ATTACHED hint="close/reopen re-fires CI"', 13);
   }
   if ("exitCode" in attachment) {
     return attachment.exitCode;
